@@ -1,0 +1,277 @@
+import pygame
+import requests
+import networkx as nx
+from datetime import datetime
+import time
+
+# Window size and color constants
+WIDTH, HEIGHT = 1200, 800
+NODE_COLOR = (0, 255, 255)           # Cyan node color
+EDGE_COLOR = (100, 255, 100)         # Light green edges
+FONT_COLOR = (240, 240, 240)         # Light gray text
+BG_COLOR = (10, 10, 20)              # Dark background
+GLOW_COLOR = (0, 255, 180)           # Bright glow accent color
+
+# Use SeiTrace API instead of Solana Helius
+SEITRACE_API = "https://api.seitrace.com/api/v1/account-transfers"
+
+# Global state variables used across functions
+node_transactions = {}              # Dictionary to store transactions per node
+selected_node = None                # Currently clicked node
+selected_transactions = []          # Transactions related to clicked node
+show_credit = False                 # Toggle flag for credit score panel
+
+def fetch_transactions(wallet_address, limit=50):
+    """
+    Fetch recent transactions for a Sei wallet using SeiTrace API.
+    Returns a list of tuples: (sender, recipient, label)
+    """
+    url = f"{SEITRACE_API}?address={wallet_address}&limit={limit}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        print("Failed to fetch from SeiTrace.")
+        return []
+
+    data = response.json().get("transfers", [])
+    transactions = []
+
+    for entry in data:
+        sender = entry.get("sender", "unknown")
+        recipient = entry.get("recipient", "unknown")
+        amount = float(entry.get("amount", 0))
+        denom = entry.get("denom", "sei")
+        timestamp = entry.get("timestamp", None)
+
+        # Format date/time
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp)
+                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                dt_str = timestamp
+        else:
+            dt_str = "unknown"
+
+        label = f"{amount:.9f} {denom.upper()} {dt_str}"
+        transactions.append((sender, recipient, label))
+
+    return transactions
+
+def estimate_credit_score(transactions):
+    """
+    Estimate a basic credit score based on transaction history.
+    Uses the age of the wallet, total number of transactions,
+    and average transaction amount to compute a composite score.
+    """
+    if not transactions:
+        return 0
+
+    timestamps = []
+    amounts = []
+    for _, _, label in transactions:
+        try:
+            # Example label: "4.500000 SEI 2025-04-20 22:11:58"
+            parts = label.split()
+            sol = float(parts[0])  # transaction amount
+            date_str = " ".join(parts[2:])  # timestamp portion
+            timestamp = time.mktime(datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").timetuple())
+            amounts.append(sol)
+            timestamps.append(timestamp)
+        except:
+            continue  # Skip if label format is bad
+
+    if not timestamps:
+        return 0
+
+    wallet_age_days = (time.time() - min(timestamps)) / 86400  # convert seconds to days
+    tx_count = len(transactions)
+    avg_tx_amount = sum(amounts) / len(amounts)
+
+    # Normalize scores between 0 and 1
+    age_score = min(wallet_age_days / 365, 1.0)
+    tx_score = min(tx_count / 100, 1.0)
+    amount_score = min(avg_tx_amount / 2, 1.0)
+
+    total_score = 0.4 * age_score + 0.3 * tx_score + 0.3 * amount_score
+    return int(total_score * 1000)
+
+def draw_node_info_panel(surface, node_name, transactions):
+    """
+    Draws a side panel showing transactions for a selected node.
+    """
+    panel_width = 380
+    panel_height = 280
+    margin = 20
+    x = margin
+    y = margin
+    panel_rect = pygame.Rect(x, y, panel_width, panel_height)
+
+    # Transparent panel background
+    s = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+    s.fill((20, 20, 40, 200))
+    surface.blit(s, (x, y))
+
+    # Glowing panel border
+    pygame.draw.rect(surface, GLOW_COLOR, panel_rect, 2, border_radius=8)
+
+    # Panel title
+    title = font.render(f"Node: {node_name[:10]}...", True, (255, 255, 0))
+    surface.blit(title, (x + 12, y + 12))
+
+    inner_y = y + 40
+    max_items = 9  # limit number of shown txs
+    for i, (direction, other_party, label) in enumerate(transactions[:max_items]):
+        txt = f"{direction} {other_party[:6]}... — {label}"
+        line = font.render(txt, True, (200, 255, 255))
+        surface.blit(line, (x + 12, inner_y + i * 24))
+
+def draw_glowing_circle(surface, color, center, radius):
+    """
+    Draws a glowing circle (used for nodes).
+    """
+    for i in range(5, 0, -1):
+        alpha = max(20, 255 // (i * 3))
+        glow_surface = pygame.Surface((radius*4, radius*4), pygame.SRCALPHA)
+        pygame.draw.circle(glow_surface, (*color, alpha), (radius*2, radius*2), radius + i*2)
+        surface.blit(glow_surface, (center[0] - radius*2, center[1] - radius*2))
+    pygame.draw.circle(surface, color, center, radius)
+
+def draw_button(surface, font, rect, text, is_active):
+    """
+    Draws a rectangular button with text.
+    """
+    pygame.draw.rect(surface, (60, 60, 100), rect, border_radius=8)
+    pygame.draw.rect(surface, (0, 255, 180) if is_active else (200, 200, 200), rect, 2, border_radius=8)
+    label = font.render(text, True, (255, 255, 255))
+    label_rect = label.get_rect(center=rect.center)
+    surface.blit(label, label_rect)
+
+def visualize_graph_pygame(transactions):
+    """
+    Visualizes a transaction graph with zoom/pan, glow, and interaction.
+    """
+    global node_transactions, selected_node, selected_transactions, show_credit
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Sei Wallet Transaction Graph")
+    clock = pygame.time.Clock()
+
+    # Set up font
+    font_path = pygame.font.match_font("consolas") or pygame.font.get_default_font()
+    global font
+    font = pygame.font.Font(font_path, 16)
+
+    # Create directed graph
+    G = nx.DiGraph()
+    node_freq = {}
+
+    # Build graph from transaction edges
+    for sender, recipient, label in transactions:
+        G.add_edge(sender, recipient, label=label)
+        node_freq[sender] = node_freq.get(sender, 0) + 1
+        node_freq[recipient] = node_freq.get(recipient, 0) + 1
+        node_transactions.setdefault(sender, []).append(("Sent to", recipient, label))
+        node_transactions.setdefault(recipient, []).append(("Received from", sender, label))
+
+    # Layout graph nodes
+    pos = nx.spring_layout(G, k=1.5, iterations=150, seed=42)
+    credit_score = estimate_credit_score(transactions)
+
+    zoom = 1.0
+    offset = [WIDTH // 2, HEIGHT // 2]
+
+    def get_scaled_pos():
+        """
+        Apply zoom and pan offset to graph positions.
+        """
+        return {
+            node: (
+                int(x * 200 * zoom + offset[0]),
+                int(y * 200 * zoom + offset[1])
+            ) for node, (x, y) in pos.items()
+        }
+
+    dragging = False
+    drag_start = (0, 0)
+    mouse_moved = False
+    running = True
+
+    while running:
+        screen.fill(BG_COLOR)
+        node_pos = get_scaled_pos()
+        button_rect = pygame.Rect(WIDTH - 180, 20, 160, 40)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    dragging = True
+                    mouse_moved = False
+                    drag_start = pygame.mouse.get_pos()
+                elif event.button == 4:  # scroll up
+                    zoom *= 1.1
+                elif event.button == 5:  # scroll down
+                    zoom /= 1.1
+
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    dragging = False
+                    if not mouse_moved:
+                        mx, my = pygame.mouse.get_pos()
+                        if button_rect.collidepoint(mx, my):
+                            show_credit = not show_credit
+                        else:
+                            for node, (x, y) in node_pos.items():
+                                if ((x - mx) ** 2 + (y - my) ** 2) ** 0.5 <= 15:
+                                    selected_node = node
+                                    selected_transactions = node_transactions.get(node, [])
+                                    break
+                elif event.button == 3:
+                    selected_node = None
+                    selected_transactions = []
+
+            elif event.type == pygame.MOUSEMOTION and dragging:
+                dx, dy = event.rel
+                if abs(dx) > 1 or abs(dy) > 1:
+                    mouse_moved = True
+                offset[0] += dx
+                offset[1] += dy
+
+        # Draw edges
+        for u, v in G.edges():
+            pygame.draw.line(screen, EDGE_COLOR, node_pos[u], node_pos[v], 2)
+
+        # Draw nodes
+        for node, (x, y) in node_pos.items():
+            draw_glowing_circle(screen, NODE_COLOR, (int(x), int(y)), 10)
+            label = node[:4] + "..."
+            text_surface = font.render(label, True, FONT_COLOR)
+            screen.blit(text_surface, (x + 12, y - 10))
+
+        # Node info panel
+        if selected_node:
+            draw_node_info_panel(screen, selected_node, selected_transactions)
+
+        # Toggle button
+        draw_button(screen, font, button_rect, "Show Credit Score", show_credit)
+        if show_credit:
+            score_text = font.render(f"Credit Score: {credit_score}", True, (255, 255, 180))
+            screen.blit(score_text, (WIDTH - 180, 70))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+
+if __name__ == "__main__":
+    # Prompt for Sei wallet address
+    wallet = input("Enter Sei wallet address: ").strip()
+    txs = fetch_transactions(wallet)
+    if txs:
+        visualize_graph_pygame(txs)
+    else:
+        print("No transactions found.")
+
+
